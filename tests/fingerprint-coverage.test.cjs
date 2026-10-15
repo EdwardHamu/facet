@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const { normalize, preset, script, DEVICE_TEMPLATES } = require('../src/main/fingerprint.cjs');
 const { environment } = require('../src/main/environment.cjs');
-const { clientHintsHeaders, attachClientHints } = require('../src/main/client-hints.cjs');
+const { clientHintsHeaders, datadogTraceHeaders, attachClientHints } = require('../src/main/client-hints.cjs');
 
 test('point 1: font fingerprint protection intercepts font checking, queryLocalFonts and measureText', () => {
   const env = environment(preset('random', {}, 'font-test-seed'));
@@ -254,3 +254,171 @@ test('point 7: Sec-CH-UA client hints headers generation and injection', () => {
   assert.equal(callbackResult.requestHeaders['Sec-CH-UA-Mobile'], '?0');
 });
 
+test('defect 1: Datadog RUM W3C trace context generation and injection on XHR/fetch', () => {
+  const trace = datadogTraceHeaders();
+  assert(trace);
+  assert(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/.test(trace.traceparent));
+  assert(/^dd=s:1;o:rum;p:[0-9a-f]{16}$/.test(trace.tracestate));
+  assert(/^\d+$/.test(trace['x-datadog-trace-id']));
+  assert(/^\d+$/.test(trace['x-datadog-parent-id']));
+  assert.equal(trace['x-datadog-origin'], 'rum');
+  assert.equal(trace['x-datadog-sampling-priority'], '1');
+
+  let listener = null;
+  const mockSession = {
+    webRequest: {
+      onBeforeSendHeaders: (filter, fn) => { listener = fn; }
+    }
+  };
+  attachClientHints(mockSession, { platform: 'Win32' });
+
+  // XHR request gets trace injected
+  let xhrResult = null;
+  listener({ resourceType: 'xhr', requestHeaders: {} }, (res) => { xhrResult = res; });
+  assert(xhrResult.requestHeaders['traceparent']);
+  assert(xhrResult.requestHeaders['tracestate']);
+  assert(xhrResult.requestHeaders['x-datadog-trace-id']);
+
+  // Pre-existing trace is not overwritten
+  let existingResult = null;
+  listener({ resourceType: 'fetch', requestHeaders: { 'traceparent': 'custom-trace' } }, (res) => { existingResult = res; });
+  assert.equal(existingResult.requestHeaders['traceparent'], 'custom-trace');
+});
+
+test('defect 2: Canvas, WebGL, Audio and ClientRects vary across different instance seeds', () => {
+  const envA = environment(preset('random', {}, 'instance-alpha'));
+  const envB = environment(preset('random', {}, 'instance-beta'));
+  const scriptA = script(envA);
+  const scriptB = script(envB);
+
+  function createSandbox(s) {
+    class MockCanvasRenderingContext2D {
+      getImageData(x, y, w, h) {
+        return { data: new Uint8ClampedArray(w * h * 4).fill(128) };
+      }
+    }
+    class MockHTMLCanvasElement {
+      constructor() { this.width = 64; this.height = 64; }
+      getContext(type) { return new MockCanvasRenderingContext2D(); }
+      toDataURL() { return 'data:image/png;base64,mock'; }
+    }
+    class MockAudioBuffer {
+      constructor(len) { this.data = new Float32Array(len).fill(0.5); }
+      getChannelData(c) { return this.data; }
+    }
+    class MockElement {
+      getBoundingClientRect() { return { x: 10, y: 20, width: 114.15625, height: 15 }; }
+      getClientRects() { return [this.getBoundingClientRect()]; }
+    }
+    const sb = {
+      window: {},
+      document: { createElement: () => new MockHTMLCanvasElement() },
+      HTMLCanvasElement: MockHTMLCanvasElement,
+      CanvasRenderingContext2D: MockCanvasRenderingContext2D,
+      AudioBuffer: MockAudioBuffer,
+      Element: MockElement,
+      DOMRect: class DOMRect {
+        constructor(x, y, w, h) { this.x = x; this.y = y; this.width = w; this.height = h; }
+      },
+      Navigator: class {},
+      Screen: class {}
+    };
+    sb.window = sb;
+    sb.navigator = new sb.Navigator();
+    sb.screen = new sb.Screen();
+    vm.createContext(sb);
+    vm.runInContext(s, sb);
+    return sb;
+  }
+
+  const sbA = createSandbox(scriptA);
+  const sbB = createSandbox(scriptB);
+
+  // 1. Canvas 2D image data differs between seeds
+  const ctxA = new sbA.CanvasRenderingContext2D();
+  const ctxB = new sbB.CanvasRenderingContext2D();
+  const dataA = ctxA.getImageData(0, 0, 16, 16).data;
+  const dataB = ctxB.getImageData(0, 0, 16, 16).data;
+  assert.notDeepEqual(dataA, dataB);
+
+  // 2. Audio buffer: critical 4500..5000 window has unique samples between seeds
+  const audioA = new sbA.AudioBuffer(6000);
+  const audioB = new sbB.AudioBuffer(6000);
+  const chanA = audioA.getChannelData(0).slice(4500, 5000);
+  const chanB = audioB.getChannelData(0).slice(4500, 5000);
+  assert.notDeepEqual(chanA, chanB);
+
+  // 3. ClientRects: width and height differ between seeds
+  const elA = new sbA.Element();
+  const elB = new sbB.Element();
+  const rectA = elA.getBoundingClientRect();
+  const rectB = elB.getBoundingClientRect();
+  assert.notEqual(rectA.width, 114.15625);
+  assert.notEqual(rectA.width, rectB.width);
+  assert.notEqual(rectA.height, rectB.height);
+  assert.notDeepEqual(elA.getClientRects(), elB.getClientRects());
+});
+
+test('defect 3: locale-aware font whitelisting blocks CJK on en-US profiles and blocks Apple fonts', () => {
+  const envEn = environment({ ...preset('random', {}, 'en-font-seed'), language: 'en-US' });
+  const scriptEn = script(envEn);
+
+  const envZh = environment({ ...preset('random', {}, 'zh-font-seed'), language: 'zh-CN' });
+  const scriptZh = script(envZh);
+
+  function createFontSandbox(s) {
+    const sb = {
+      window: {},
+      document: { fonts: { check: () => true } },
+      FontFaceSet: class FontFaceSet { check() { return true; } },
+      CanvasRenderingContext2D: class CanvasRenderingContext2D { measureText() { return { width: 100 }; } },
+      Navigator: class Navigator {},
+      Screen: class Screen {},
+      HTMLCanvasElement: class HTMLCanvasElement {}
+    };
+    sb.window = sb;
+    sb.navigator = new sb.Navigator();
+    sb.screen = new sb.Screen();
+    sb.window.FontFaceSet = sb.FontFaceSet;
+    sb.window.CanvasRenderingContext2D = sb.CanvasRenderingContext2D;
+    vm.createContext(sb);
+    vm.runInContext(s, sb);
+    return sb;
+  }
+
+  const sbEn = createFontSandbox(scriptEn);
+  const sbZh = createFontSandbox(scriptZh);
+
+  // On en-US Windows:
+  // Western fonts return true
+  assert.equal(sbEn.document.fonts.check('16px "Arial"'), true);
+  assert.equal(sbEn.document.fonts.check('16px "Segoe UI"'), true);
+  // Chinese fonts return false on en-US!
+  assert.equal(sbEn.document.fonts.check('16px "Microsoft YaHei"'), false);
+  assert.equal(sbEn.document.fonts.check('16px "SimSun"'), false);
+  assert.equal(sbEn.document.fonts.check('16px "SimHei"'), false);
+  // Apple fonts return false on Windows!
+  assert.equal(sbEn.document.fonts.check('16px "PingFang SC"'), false);
+  assert.equal(sbEn.document.fonts.check('16px "PingFang SC", sans-serif'), false);
+
+  // On zh-CN Windows:
+  // Chinese fonts return true
+  assert.equal(sbZh.document.fonts.check('16px "Microsoft YaHei"'), true);
+  assert.equal(sbZh.document.fonts.check('16px "SimSun"'), true);
+  // Apple fonts still return false on Windows!
+  assert.equal(sbZh.document.fonts.check('16px "PingFang SC"'), false);
+});
+
+test('defect 4: User-Agent and Client Hints vary across different instance seeds', () => {
+  const envA = environment(preset('random', {}, 'instance-ua-1'));
+  const envB = environment(preset('random', {}, 'instance-ua-2'));
+
+  assert(envA.userAgent.includes('Chrome/'));
+  assert(envB.userAgent.includes('Chrome/'));
+  assert.notEqual(envA.userAgent, envB.userAgent);
+
+  const hintsA = clientHintsHeaders(envA);
+  const hintsB = clientHintsHeaders(envB);
+  assert(hintsA['Sec-CH-UA']);
+  assert(hintsB['Sec-CH-UA']);
+});

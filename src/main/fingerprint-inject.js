@@ -7,6 +7,7 @@
   if (!fp || typeof fp !== "object") return;
 
   var markNative = function(replacement) { return replacement; };
+
   var define = function (obj, key, value) {
     try {
       var old = Object.getOwnPropertyDescriptor(obj, key);
@@ -32,18 +33,33 @@
     define(Screen.prototype, "colorDepth", fp.ColorDepth);
     define(Screen.prototype, "pixelDepth", fp.ColorDepth);
   }
-  /* ---------------- Canvas 噪声 ----------------
-   * 种子决定步长与增量，同一实例跨会话恒定。
+
+  /* ---------------- Canvas / WebGL 像素噪点 ----------------
+   * 采用高熵 32 位伪随机数发生器，根据种子对像素多通道实施亚感知离散微扰，
+   * 彻底避免同步长单通道偏移导致的指纹特征重合。
    * 注意 toDataURL / toBlob 走「离屏副本」路径：必须先克隆再写噪点，
-   * 否则会把噪点写回用户可见的画布，页面自己看得出来。            */
+   * 否则会把噪点写回用户可见的画布，页面自己看得出来。 */
   var noisePixels = function (data, seed) {
     if (!data || data.length < 4) return data;
-    var step = Math.max(4, Math.floor(data.length / 32 / 4) * 4);
-    var delta = (Math.abs(seed) % 3) + 1;
-    var start = Math.abs(seed) % Math.max(1, Math.min(step, data.length - 3));
-    for (var i = start; i < data.length; i += step) {
-      var p = i - (i % 4);
-      data[p] = (data[p] + delta) & 255;
+    var s = (Math.abs(seed) || 135792468) >>> 0;
+    var nextRand = function () {
+      s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+      return s;
+    };
+    var len = data.length;
+    var step = Math.max(4, Math.floor(len / 64 / 4) * 4);
+    var start = (nextRand() % 8) * 4;
+    for (var i = start; i < len; i += step) {
+      var r = nextRand();
+      var ch = r & 3;
+      if (ch === 3) ch = 0; // 保护 Alpha 通道不失真
+      var delta = ((r >>> 2) % 5) - 2; // -2, -1, 0, 1, 2
+      if (delta === 0) delta = (r & 1) ? 1 : -1;
+      var idx = i + ch;
+      if (idx < len) {
+        var val = data[idx] + delta;
+        data[idx] = val < 0 ? 0 : (val > 255 ? 255 : val);
+      }
     }
     return data;
   };
@@ -57,30 +73,42 @@
     }, originalImageData);
 
     var cloneWithNoise = function (self) {
-      var copy = document.createElement("canvas");
-      copy.width = self.width;
-      copy.height = self.height;
-      var ctx = copy.getContext("2d");
-      ctx.drawImage(self, 0, 0);
-      var image = originalImageData.call(ctx, 0, 0, copy.width, copy.height);
-      noisePixels(image.data, fp.CanvasSeed);
-      ctx.putImageData(image, 0, 0);
-      return copy;
+      try {
+        var copy = document.createElement("canvas");
+        copy.width = self.width;
+        copy.height = self.height;
+        var ctx = copy.getContext("2d");
+        if (!ctx) return self;
+        ctx.drawImage(self, 0, 0);
+        var image = originalImageData.call(ctx, 0, 0, copy.width, copy.height);
+        if (image && image.data) {
+          noisePixels(image.data, fp.CanvasSeed || fp.WebGlSeed || 1);
+          ctx.putImageData(image, 0, 0);
+          return copy;
+        }
+      } catch (e) {}
+      return self;
     };
 
     var originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
     HTMLCanvasElement.prototype.toDataURL = markNative(function () {
-      try { return originalToDataURL.apply(cloneWithNoise(this), arguments); }
-      catch (e) { return originalToDataURL.apply(this, arguments); }
+      try {
+        var noisy = cloneWithNoise(this);
+        if (noisy) return originalToDataURL.apply(noisy, arguments);
+      } catch (e) {}
+      return originalToDataURL.apply(this, arguments);
     }, originalToDataURL);
 
     var originalToBlob = HTMLCanvasElement.prototype.toBlob;
     if (originalToBlob) {
       HTMLCanvasElement.prototype.toBlob = markNative(function (callback) {
         try {
+          var noisy = cloneWithNoise(this);
           var args = Array.prototype.slice.call(arguments, 1);
-          return originalToBlob.call(cloneWithNoise(this), callback, ...args);
-        } catch (e) { return originalToBlob.apply(this, arguments); }
+          return originalToBlob.call(noisy || this, callback, ...args);
+        } catch (e) {
+          return originalToBlob.apply(this, arguments);
+        }
       }, originalToBlob);
     }
   } catch (e) {}
@@ -105,7 +133,7 @@
         var originalReadPixels = Type.prototype.readPixels;
         Type.prototype.readPixels = markNative(function (x, y, w, h, fmt, type, pixels) {
           originalReadPixels.apply(this, arguments);
-          if (pixels && pixels.length) noisePixels(pixels, fp.CanvasSeed);
+          if (pixels && pixels.length) noisePixels(pixels, fp.CanvasSeed || fp.WebGlSeed || 1);
         }, originalReadPixels);
       }
     } catch (e) {}
@@ -192,62 +220,139 @@
   }
 
   /* ---------------- 字体指纹探测防护 ----------------
-   * 拦截 document.fonts.check 与 queryLocalFonts，对非标准系统字体返回 false/空；
-   * 并在 measureText 中针对非系统标准字体回退为通用字体，结合种子对宽度施加微扰，
-   * 阻断基于字体枚举与排版尺寸对比推测本机软件/字体列表。 */
+   * 拦截 document.fonts.check 与 queryLocalFonts，根据环境语言（Language）动态过滤：
+   * 1. 英文/西方配置严禁泄露 CJK 中日韩字体（如 SimSun, Microsoft YaHei, Meiryo 等）；
+   * 2. Windows 平台坚决屏蔽 macOS/iOS 专属字体（如 PingFang SC, Apple Color Emoji）；
+   * 3. 严格解析 CSS 字体规范提取主字体名称，防止 ", sans-serif" 兜底后缀绕过白名单。 */
   if (fp.Fonts || fp.Hardware) {
     try {
-      var standardFonts = [
+      var lang = String(fp.Language || "").toLowerCase();
+      var isChineseLocale = lang.indexOf("zh") === 0;
+      var isJapaneseLocale = lang.indexOf("ja") === 0;
+      var isKoreanLocale = lang.indexOf("ko") === 0;
+
+      // Windows 基础通用英文标准字体（所有 Windows 安装版本 100% 自带）
+      var standardWesternFonts = [
         "arial", "arial black", "calibri", "cambria", "cambria math", "comic sans ms",
         "consolas", "courier", "courier new", "georgia", "impact", "lucida console",
-        "lucida sans unicode", "microsoft sans serif", "microsoft yahei", "ms gothic",
-        "ms pgothic", "ms sans serif", "ms serif", "palatino linotype", "segoe print",
-        "segoe script", "segoe ui", "segoe ui symbol", "simsun", "tahoma", "times new roman",
-        "trebuchet ms", "verdana", "yu gothic"
+        "lucida sans unicode", "microsoft sans serif", "palatino linotype", "segoe print",
+        "segoe script", "segoe ui", "segoe ui symbol", "tahoma", "times new roman",
+        "trebuchet ms", "verdana"
       ];
-      var isStandardFont = function (fontSpec) {
-        if (!fontSpec || typeof fontSpec !== "string") return true;
-        var fontLower = fontSpec.toLowerCase().replace(/['"]/g, "");
-        for (var i = 0; i < standardFonts.length; i++) {
-          if (fontLower.indexOf(standardFonts[i]) !== -1) return true;
+
+      var allowedFonts = standardWesternFonts.slice();
+      if (isChineseLocale) {
+        allowedFonts.push("microsoft yahei", "simsun", "simhei", "kaiti", "fangsong", "dengxian");
+      } else if (isJapaneseLocale) {
+        allowedFonts.push("ms gothic", "ms pgothic", "yu gothic", "meiryo");
+      } else if (isKoreanLocale) {
+        allowedFonts.push("malgun gothic", "gulim", "batang", "dotum");
+      }
+
+      // Apple 专属字体在 Windows 下永远非法
+      var appleFonts = [
+        "pingfang", "pingfang sc", "pingfang tc", "pingfang hk", "noto sans cjk",
+        "apple color emoji", "san francisco", "helvetica", "helvetica neue",
+        "menlo", "monaco", "sf pro", "sf mono"
+      ];
+
+      // 提取被测主字体（剥离字号、字重以及兜底 fallback 如 , sans-serif）
+      var extractPrimaryFont = function (fontSpec) {
+        if (!fontSpec || typeof fontSpec !== "string") return "";
+        var clean = fontSpec.replace(/^\s*(?:(?:italic|oblique|small-caps|bold|bolder|lighter|\d+)\s+)*(?:\d+(?:\.\d+)?(?:px|pt|em|rem|%)\s*(?:\/\s*\d+(?:\.\d+)?(?:px|pt|em|rem|%)?)?\s+)/i, "").trim();
+        var primary = clean.split(",")[0].trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+        return primary;
+      };
+
+      var isAllowedFont = function (fontSpec) {
+        var primary = extractPrimaryFont(fontSpec);
+        if (!primary) return true;
+        // 通用族系永远合法
+        if (primary === "sans-serif" || primary === "serif" || primary === "monospace" || primary === "cursive" || primary === "fantasy" || primary === "system-ui") {
+          return true;
+        }
+        // Windows 平台严防 Apple 专属字体泄露
+        for (var a = 0; a < appleFonts.length; a++) {
+          if (primary.indexOf(appleFonts[a]) !== -1) return false;
+        }
+        // 比对当前语言环境下允许的系统标准字体
+        for (var i = 0; i < allowedFonts.length; i++) {
+          if (primary === allowedFonts[i] || primary.indexOf(allowedFonts[i]) !== -1) return true;
         }
         return false;
       };
+
       if (document.fonts && document.fonts.check) {
         var origFontCheck = document.fonts.check;
         document.fonts.check = markNative(function (font, text) {
-          if (!isStandardFont(font)) return false;
+          if (!isAllowedFont(font)) return false;
           return origFontCheck.apply(this, arguments);
         }, origFontCheck);
       }
       if (window.FontFaceSet && FontFaceSet.prototype.check) {
         var origFontFaceCheck = FontFaceSet.prototype.check;
         FontFaceSet.prototype.check = markNative(function (font, text) {
-          if (!isStandardFont(font)) return false;
+          if (!isAllowedFont(font)) return false;
           return origFontFaceCheck.apply(this, arguments);
         }, origFontFaceCheck);
       }
+
+      var FONT_PROFILES = {
+        "arial": { family: "Arial", postscriptName: "ArialMT" },
+        "arial black": { family: "Arial Black", postscriptName: "Arial-Black" },
+        "calibri": { family: "Calibri", postscriptName: "Calibri" },
+        "cambria": { family: "Cambria", postscriptName: "Cambria" },
+        "cambria math": { family: "Cambria Math", postscriptName: "CambriaMath" },
+        "comic sans ms": { family: "Comic Sans MS", postscriptName: "ComicSansMS" },
+        "consolas": { family: "Consolas", postscriptName: "Consolas" },
+        "courier": { family: "Courier", postscriptName: "Courier" },
+        "courier new": { family: "Courier New", postscriptName: "CourierNewPSMT" },
+        "georgia": { family: "Georgia", postscriptName: "Georgia" },
+        "impact": { family: "Impact", postscriptName: "Impact" },
+        "lucida console": { family: "Lucida Console", postscriptName: "LucidaConsole" },
+        "lucida sans unicode": { family: "Lucida Sans Unicode", postscriptName: "LucidaSansUnicode" },
+        "microsoft sans serif": { family: "Microsoft Sans Serif", postscriptName: "MicrosoftSansSerif" },
+        "palatino linotype": { family: "Palatino Linotype", postscriptName: "PalatinoLinotype" },
+        "segoe print": { family: "Segoe Print", postscriptName: "SegoePrint" },
+        "segoe script": { family: "Segoe Script", postscriptName: "SegoeScript" },
+        "segoe ui": { family: "Segoe UI", postscriptName: "SegoeUI" },
+        "segoe ui symbol": { family: "Segoe UI Symbol", postscriptName: "SegoeUISymbol" },
+        "tahoma": { family: "Tahoma", postscriptName: "Tahoma" },
+        "times new roman": { family: "Times New Roman", postscriptName: "TimesNewRomanPSMT" },
+        "trebuchet ms": { family: "Trebuchet MS", postscriptName: "TrebuchetMS" },
+        "verdana": { family: "Verdana", postscriptName: "Verdana" },
+        "microsoft yahei": { family: "Microsoft YaHei", postscriptName: "MicrosoftYaHei" },
+        "simsun": { family: "SimSun", postscriptName: "SimSun" },
+        "simhei": { family: "SimHei", postscriptName: "SimHei" },
+        "kaiti": { family: "KaiTi", postscriptName: "KaiTi" },
+        "fangsong": { family: "FangSong", postscriptName: "FangSong" },
+        "dengxian": { family: "DengXian", postscriptName: "DengXian" },
+        "ms gothic": { family: "MS Gothic", postscriptName: "MSGothic" },
+        "ms pgothic": { family: "MS PGothic", postscriptName: "MSPGothic" },
+        "yu gothic": { family: "Yu Gothic", postscriptName: "YuGothic" },
+        "meiryo": { family: "Meiryo", postscriptName: "Meiryo" },
+        "malgun gothic": { family: "Malgun Gothic", postscriptName: "MalgunGothic" },
+        "gulim": { family: "Gulim", postscriptName: "Gulim" },
+        "batang": { family: "Batang", postscriptName: "Batang" },
+        "dotum": { family: "Dotum", postscriptName: "Dotum" }
+      };
       if (window.queryLocalFonts) {
         window.queryLocalFonts = markNative(function () {
-          var list = [
-            { family: "Arial", fullName: "Arial", postscriptName: "ArialMT", style: "Regular" },
-            { family: "Calibri", fullName: "Calibri", postscriptName: "Calibri", style: "Regular" },
-            { family: "Consolas", fullName: "Consolas", postscriptName: "Consolas", style: "Regular" },
-            { family: "Courier New", fullName: "Courier New", postscriptName: "CourierNewPSMT", style: "Regular" },
-            { family: "Microsoft YaHei", fullName: "Microsoft YaHei", postscriptName: "MicrosoftYaHei", style: "Regular" },
-            { family: "Segoe UI", fullName: "Segoe UI", postscriptName: "SegoeUI", style: "Regular" },
-            { family: "Times New Roman", fullName: "Times New Roman", postscriptName: "TimesNewRomanPSMT", style: "Regular" },
-            { family: "Verdana", fullName: "Verdana", postscriptName: "Verdana", style: "Regular" }
-          ];
+          var list = allowedFonts.map(function (f) {
+            var info = FONT_PROFILES[f] || { family: f, postscriptName: f.replace(/\s+/g, "") };
+            return { family: info.family, fullName: info.family, postscriptName: info.postscriptName, style: "Regular" };
+          });
           return Promise.resolve(list);
-        });
+        }, window.queryLocalFonts);
       }
+
       if (window.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype.measureText) {
         var origMeasureText = CanvasRenderingContext2D.prototype.measureText;
-        var fontJitter = ((Math.abs(fp.FontsSeed || 0) % 7) - 3) * 0.0001;
+        var fontSeed = (Math.abs(fp.FontsSeed || 0) || 54321) >>> 0;
+        var fontJitter = ((((fontSeed % 5) + 1) * ((fontSeed & 1) ? 1 : -1)) * 0.0002);
         CanvasRenderingContext2D.prototype.measureText = markNative(function (text) {
           var metrics = origMeasureText.apply(this, arguments);
-          if (metrics && typeof metrics.width === "number" && fontJitter !== 0) {
+          if (metrics && typeof metrics.width === "number") {
             try {
               var w = metrics.width + fontJitter;
               return new Proxy(metrics, {
@@ -266,8 +371,10 @@
   }
 
   /* ---------------- Audio 指纹 ----------------
-   * 单点微扰 1e-8 量级：足以改变浮点摘要，不足以让听感或波形分析察觉。 */
+   * 对音频缓冲区进行均匀亚耳听阈微扰（1e-7 ~ 1e-8 量级），
+   * 既能彻底打破 4500..5000 及全频段时域/频域哈希，又完全不会影响声音播放听感。 */
   if (fp.Audio) try {
+    var audioSeedVal = (Math.abs(fp.AudioSeed || 0) || 987654321) >>> 0;
     if (window.AudioBuffer && AudioBuffer.prototype.getChannelData) {
       var originalAudio = AudioBuffer.prototype.getChannelData;
       var touched = new WeakMap();
@@ -275,36 +382,101 @@
         var data = originalAudio.apply(this, arguments);
         var channels = touched.get(this);
         if (!channels) { channels = new Set(); touched.set(this, channels); }
-        if (data && !channels.has(Number(arguments[0])) && data.length) {
-          channels.add(Number(arguments[0]));
-          var index = Math.abs(fp.AudioSeed) % data.length;
-          data[index] = data[index] + (((Math.abs(fp.AudioSeed) % 11) + 1) * 1e-8);
+        var chNum = Number(arguments[0]) || 0;
+        if (data && !channels.has(chNum) && data.length) {
+          channels.add(chNum);
+          var s = (audioSeedVal + chNum * 7919) >>> 0;
+          var nextAudioRand = function () {
+            s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+            return s;
+          };
+          var len = data.length;
+          // 覆盖整个采样窗口，以固定步长微扰采样点
+          var step = Math.max(8, Math.min(64, Math.floor(len / 128)));
+          var offset = nextAudioRand() % step;
+          for (var i = offset; i < len; i += step) {
+            var r = nextAudioRand();
+            var jitter = (((r % 9) - 4) || 1) * 1e-7;
+            data[i] = data[i] + jitter;
+          }
         }
         return data;
       }, originalAudio);
     }
+    if (window.AnalyserNode && AnalyserNode.prototype.getFloatFrequencyData) {
+      var origGetFloatFreq = AnalyserNode.prototype.getFloatFrequencyData;
+      AnalyserNode.prototype.getFloatFrequencyData = markNative(function (array) {
+        origGetFloatFreq.apply(this, arguments);
+        if (array && array.length) {
+          var s = (audioSeedVal ^ 0x5a5a5a5a) >>> 0;
+          for (var i = 0; i < array.length; i += 8) {
+            s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+            array[i] += (((s % 7) - 3) * 0.001);
+          }
+        }
+      }, origGetFloatFreq);
+    }
   } catch (e) {}
 
   /* ---------------- 元素盒模型微扰 ----------------
-   * 亚像素级偏移，破坏 getBoundingClientRect 的精确指纹，
-   * 又不至于影响布局判定（各站点阈值通常远大于 1e-5）。 */
-  var rectNoise = ((Math.abs(fp.ClientRectsSeed) % 9) + 1) * 0.00001;
+   * 亚像素级微扰 x, y, width, height，同时拦截 getBoundingClientRect 与 getClientRects，
+   * 破坏以 114.15625x15 等文字排版或盒模型尺寸为特征的 DOM 指纹，
+   * 扰动量控制在 1e-4 量级，对人眼与页面布局完全无影响。 */
+  var rectSeedVal = (Math.abs(fp.ClientRectsSeed || 0) || 13579) >>> 0;
+  var rectNoiseX = (((rectSeedVal % 9) + 1) * 0.00002);
+  var rectNoiseY = ((((rectSeedVal >>> 4) % 9) + 1) * 0.00002);
+  var rectNoiseW = ((((rectSeedVal >>> 8) % 7) - 3) || 1) * 0.00003;
+  var rectNoiseH = ((((rectSeedVal >>> 12) % 7) - 3) || 1) * 0.00003;
+
   var cloneRect = function (r) {
-    try { return new DOMRect(r.x + rectNoise, r.y + rectNoise, r.width, r.height); }
-    catch (e) { return r; }
+    if (!r) return r;
+    try {
+      var w = typeof r.width === "number" ? Math.max(0, r.width + rectNoiseW) : r.width;
+      var h = typeof r.height === "number" ? Math.max(0, r.height + rectNoiseH) : r.height;
+      return new DOMRect(r.x + rectNoiseX, r.y + rectNoiseY, w, h);
+    } catch (e) {
+      return r;
+    }
   };
+
   if (fp.Rects) try {
     var originalRect = Element.prototype.getBoundingClientRect;
     Element.prototype.getBoundingClientRect = markNative(function () {
       return cloneRect(originalRect.apply(this, arguments));
     }, originalRect);
+
+    var origGetClientRects = Element.prototype.getClientRects;
+    if (origGetClientRects) {
+      Element.prototype.getClientRects = markNative(function () {
+        var list = origGetClientRects.apply(this, arguments);
+        if (!list) return list;
+        var arr = [];
+        for (var i = 0; i < list.length; i++) {
+          arr.push(cloneRect(list[i]));
+        }
+        return arr;
+      }, origGetClientRects);
+    }
   } catch (e) {}
+
   if (fp.Rects) try {
     if (window.Range && Range.prototype.getBoundingClientRect) {
       var originalRangeRect = Range.prototype.getBoundingClientRect;
       Range.prototype.getBoundingClientRect = markNative(function () {
         return cloneRect(originalRangeRect.apply(this, arguments));
       }, originalRangeRect);
+    }
+    if (window.Range && Range.prototype.getClientRects) {
+      var originalRangeRects = Range.prototype.getClientRects;
+      Range.prototype.getClientRects = markNative(function () {
+        var list = originalRangeRects.apply(this, arguments);
+        if (!list) return list;
+        var arr = [];
+        for (var i = 0; i < list.length; i++) {
+          arr.push(cloneRect(list[i]));
+        }
+        return arr;
+      }, originalRangeRects);
     }
   } catch (e) {}
 
