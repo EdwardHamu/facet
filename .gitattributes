@@ -1,0 +1,4 @@
+# Ensure specific files maintain exact byte representations and line endings to match hashes
+resources/process-host/ProcessHost.cs text eol=lf
+resources/process-host/facet-process-host.exe binary
+resources/mihomo/* binary

@@ -100,7 +100,7 @@ const DEVICE_TEMPLATES = Object.freeze([
 ]);
 
 
-const FLAGS=['hardware','webgl','canvas','audio','rects'];
+const FLAGS=['hardware','webgl','canvas','audio','rects','fonts','media','webgpu'];
 function normalize(value={}){
  if(!value||typeof value!=='object'||Array.isArray(value))throw Error('指纹设置格式无效');
  const enabled=value.enabled===true, seed=String(value.seed|| (enabled?crypto.randomBytes(16).toString('hex'):''));
@@ -122,7 +122,7 @@ function preset(id,base={},seed=crypto.randomBytes(16).toString('hex')){
   return {...base,colorScheme:['system','light','dark'][choice('color-scheme')%3],reducedMotion:choice('reduced-motion')%2?'reduce':'no-preference',
    userAgent:generatedUserAgent(),platform:'Win32',cpu:plan.cpu,
    width:base.width||0,height:base.height||0,scale:full?screen.dpr:(base.scale||0),
-   fingerprint:normalize({...current,enabled:true,hardware:full||!!(base.fingerprint?.enabled&&current.hardware),webgl:true,canvas:true,audio:true,seed,template:catalog.ID,
+   fingerprint:normalize({...current,enabled:true,hardware:full||!!(base.fingerprint?.enabled&&current.hardware),webgl:true,canvas:true,audio:true,fonts:true,media:true,webgpu:true,seed,template:catalog.ID,
     screenWidth:full?screen.width:current.screenWidth,screenHeight:full?screen.height:current.screenHeight,availHeight:full?screen.availHeight:current.availHeight,
     memory:plan.memory,touch:0,colorDepth:24,vendor:plan.gpu.vendor,renderer:plan.gpu.renderer})};
  }
@@ -139,7 +139,7 @@ function generatedMetadata(env,native){
 }
 function script(env){const f=normalize(env.fingerprint);if(!f.enabled)return null;
  const seed=key=>crypto.createHash('sha256').update(f.seed+':'+key).digest().readUInt32LE(0);
- const payload={Hardware:f.hardware,WebGL:f.webgl,Canvas:f.canvas,Audio:f.audio,Rects:f.rects,DeviceMemory:f.memory,MaxTouchPoints:f.touch,ScreenWidth:f.screenWidth,ScreenHeight:f.screenHeight,AvailableScreenHeight:f.availHeight,ColorDepth:f.colorDepth,WebGlVendor:f.vendor,WebGlRenderer:f.renderer,CanvasSeed:seed('canvas'),AudioSeed:seed('audio'),ClientRectsSeed:seed('rects')};
+ const payload={Hardware:f.hardware,WebGL:f.webgl,Canvas:f.canvas,Audio:f.audio,Rects:f.rects,Fonts:f.fonts||f.hardware,Media:f.media||f.hardware,WebGPU:f.webgpu||f.webgl||(f.hardware&&!!f.vendor),DeviceMemory:f.memory,HardwareConcurrency:env.cpu||8,MaxTouchPoints:f.touch,ScreenWidth:f.screenWidth,ScreenHeight:f.screenHeight,AvailableScreenHeight:f.availHeight,ColorDepth:f.colorDepth,WebGlVendor:f.vendor,WebGlRenderer:f.renderer,Seed:f.seed,CanvasSeed:seed('canvas'),AudioSeed:seed('audio'),ClientRectsSeed:seed('rects'),FontsSeed:seed('fonts'),MediaSeed:seed('media'),WebGlSeed:seed('webgl')};
  const source=fs.readFileSync(path.join(__dirname,'fingerprint-inject.js'),'utf8'),slot='/*__FACET_FP_PAYLOAD__*/null';if(source.split(slot).length!==2)throw Error('指纹注入槽位无效');return source.replace(slot,()=>JSON.stringify(payload));
 }
 module.exports={normalize,preset,script,DEVICE_TEMPLATES,generatedMetadata,generatedUserAgent};
